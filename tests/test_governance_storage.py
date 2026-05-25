@@ -153,6 +153,112 @@ class TestRoleCRUD:
 
 
 # ---------------------------------------------------------------------------
+# Role permission overrides (builtin-role customization layer)
+# ---------------------------------------------------------------------------
+
+
+class TestRolePermissionOverrides:
+    def test_overrides_empty_by_default(self, db):
+        db.create_role("r1", "admin", "Admin", "read,write", builtin=True, org_id="")
+        assert db.list_role_overrides("r1") == []
+        eff = db.effective_role_permissions("r1")
+        assert eff["baseline"] == ["read", "write"]
+        assert eff["grants"] == []
+        assert eff["revokes"] == []
+        assert eff["effective"] == ["read", "write"]
+
+    def test_set_role_overrides_grant_and_revoke(self, db):
+        db.create_role("r1", "admin", "Admin", "read,write", builtin=True, org_id="")
+        db.set_role_overrides("r1", {"approve"}, {"write"}, created_by="u-admin")
+        eff = db.effective_role_permissions("r1")
+        assert eff["baseline"] == ["read", "write"]
+        assert eff["grants"] == ["approve"]
+        assert eff["revokes"] == ["write"]
+        assert eff["effective"] == ["approve", "read"]
+
+    def test_set_role_overrides_replaces_prior_state(self, db):
+        db.create_role("r1", "admin", "Admin", "read,write", builtin=True, org_id="")
+        db.set_role_overrides("r1", {"approve"}, set())
+        db.set_role_overrides("r1", set(), {"write"})
+        rows = db.list_role_overrides("r1")
+        # Prior grant is gone; only the new revoke remains.
+        assert len(rows) == 1
+        assert rows[0]["permission"] == "write"
+        assert rows[0]["action"] == "revoke"
+
+    def test_set_role_overrides_disjoint_required(self, db):
+        db.create_role("r1", "admin", "Admin", "read", builtin=True, org_id="")
+        with pytest.raises(ValueError):
+            db.set_role_overrides("r1", {"write"}, {"write"})
+
+    def test_clear_role_overrides(self, db):
+        db.create_role("r1", "admin", "Admin", "read", builtin=True, org_id="")
+        db.set_role_overrides("r1", {"approve"}, set())
+        assert len(db.list_role_overrides("r1")) == 1
+        db.clear_role_overrides("r1")
+        assert db.list_role_overrides("r1") == []
+
+    def test_get_user_permissions_applies_overlay_to_builtin(self, db):
+        db.create_role("r1", "admin", "Admin", "read,write", builtin=True, org_id="")
+        db.create_user("u1", "alice", "Alice", "$2b$hash")
+        db.assign_role("u1", "r1")
+        # Before overrides: baseline only
+        assert db.get_user_permissions("u1") == {"read", "write"}
+        # After overrides: grants in, revokes out
+        db.set_role_overrides("r1", {"approve", "model.skills.write"}, {"write"})
+        assert db.get_user_permissions("u1") == {"read", "approve", "model.skills.write"}
+
+    def test_get_user_permissions_ignores_overlay_on_custom_role(self, db):
+        # Overrides only apply to builtin rows.  A custom role with stray
+        # override rows (defensive case — should never happen via the API)
+        # must NOT have them applied.
+        db.create_role("r1", "custom", "Custom", "read", builtin=False, org_id="")
+        db.create_user("u1", "alice", "Alice", "$2b$hash")
+        db.assign_role("u1", "r1")
+        db.set_role_overrides("r1", {"approve"}, {"read"})
+        # Effective perms come from the role row only — overlay is dropped.
+        assert db.get_user_permissions("u1") == {"read"}
+
+    def test_users_with_permission_bulk(self, db):
+        # Two roles, three users; only users whose EFFECTIVE perm set
+        # includes the queried perm appear.  Drives the lockout-guard
+        # rewrite in admin_role_overrides — one bulk SELECT replaces
+        # the prior per-user/per-role loop.
+        db.create_role("r-adm", "adm", "Adm", "admin.roles,read", builtin=True, org_id="")
+        db.create_role("r-op", "op", "Op", "read,write", builtin=True, org_id="")
+        db.create_user("u1", "alice", "Alice", "$2b$hash")
+        db.create_user("u2", "bob", "Bob", "$2b$hash")
+        db.create_user("u3", "cara", "Cara", "$2b$hash")
+        db.assign_role("u1", "r-adm")
+        db.assign_role("u2", "r-op")
+        db.assign_role("u3", "r-op")
+        # Baseline state
+        assert db.users_with_permission("admin.roles") == {"u1"}
+        # Overlay-grant admin.roles to r-op → u2 + u3 now hold it too
+        db.set_role_overrides("r-op", {"admin.roles"}, set())
+        assert db.users_with_permission("admin.roles") == {"u1", "u2", "u3"}
+        # exclude_role_id = r-adm → u1 drops; u2/u3 still hold via r-op
+        assert db.users_with_permission("admin.roles", exclude_role_id="r-adm") == {
+            "u2",
+            "u3",
+        }
+        # Overlay-revoke admin.roles from r-adm → u1 no longer holds via that role
+        db.set_role_overrides("r-adm", set(), {"admin.roles"})
+        assert db.users_with_permission("admin.roles") == {"u2", "u3"}
+
+    def test_delete_role_cleans_up_overrides(self, db):
+        # F-7: no FK on role_permission_overrides.  Storage layer must
+        # clean up by hand so a re-seeded role_id (deterministic for
+        # builtins on schema reseed) doesn't silently inherit stale
+        # overrides from the prior occupant.
+        db.create_role("r1", "custom", "Custom", "read", builtin=False, org_id="")
+        db.set_role_overrides("r1", {"approve"}, set())
+        assert len(db.list_role_overrides("r1")) == 1
+        assert db.delete_role("r1") is True
+        assert db.list_role_overrides("r1") == []
+
+
+# ---------------------------------------------------------------------------
 # Organizations
 # ---------------------------------------------------------------------------
 

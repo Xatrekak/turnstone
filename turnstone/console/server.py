@@ -1761,7 +1761,18 @@ async def create_workstream(request: Request) -> JSONResponse:
     - ``node_id`` omitted or ``"auto"`` → console picks the node with most headroom
     - ``node_id`` set to ``"pool"`` → console picks any available node
     """
+    from turnstone.core.auth import require_any_permission
     from turnstone.core.web_helpers import read_json_or_400
+
+    # Gate on workstreams.create OR admin.coordinator before proxying —
+    # keeps the 403 attributed at the console (audit clarity) and avoids
+    # a cluster round-trip on a forbidden request.  The node-side lift
+    # gates again as defense in depth.  See ``interactive_endpoint_config``
+    # in ``turnstone/server.py`` for the OR rationale (coord sessions
+    # spawning interactive children).
+    err = require_any_permission(request, ("workstreams.create", "admin.coordinator"))
+    if err is not None:
+        return err
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
@@ -1892,7 +1903,17 @@ async def route_create(request: Request) -> Response:
     console can hash to the owning node before the multipart body lands —
     we do not parse the body just to peek at the metadata.
     """
+    from turnstone.core.auth import require_any_permission
+
     t0 = time.monotonic()
+    # Fail fast on forbidden requests — the upstream node's lift gates
+    # too (see ``make_create_handler`` in session_routes.py).
+    # ``admin.coordinator`` is accepted so coord sessions can spawn
+    # interactive children via the route proxy without holding
+    # ``workstreams.create``.
+    err = require_any_permission(request, ("workstreams.create", "admin.coordinator"))
+    if err is not None:
+        return _record_route(request, "create", 403, t0, err)
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
     if not ring_ready:
@@ -2267,12 +2288,32 @@ async def route_proxy(request: Request) -> Response:
     legacies still in scope). ``verb`` drives the audit action lookup;
     DELETE on ``/send`` is treated as dequeue for audit attribution.
     """
+    from turnstone.core.auth import require_any_permission
+
     t0 = time.monotonic()
     # Extract verb name from URL tail: /v1/api/route/.../send -> "send".
     # DELETE on /send is the dequeue path — audit attribution diverges.
     verb = request.url.path.rsplit("/", 1)[-1]
     if verb == "send" and request.method == "DELETE":
         verb = "dequeue"
+
+    # Verb-scoped permission gate.  Redundant with the node-side lift's
+    # check (the upstream server gates again), but failing fast at the
+    # proxy avoids a cluster round-trip on a forbidden request and keeps
+    # the 403 attributed to the proxy in audit logs.  Only the two verbs
+    # whose perms exist; other verbs (send/cancel/dequeue/command/plan)
+    # remain authenticated-only and pre-existing — leaving them alone
+    # rather than expanding scope.  ``admin.coordinator`` accepted as
+    # an alternative on each so coord sessions driving interactive
+    # children pass through without the operator-style perms.
+    _verb_perms: dict[str, tuple[str, ...]] = {
+        "approve": ("tools.approve", "admin.coordinator"),
+        "close": ("workstreams.close", "admin.coordinator"),
+    }
+    if verb in _verb_perms:
+        err = require_any_permission(request, _verb_perms[verb])
+        if err is not None:
+            return _record_route(request, verb, 403, t0, err)
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
     if not ring_ready:
@@ -5904,6 +5945,11 @@ _VALID_PERMISSIONS = frozenset(
         # explicitly before their coordinator sessions can mutate the
         # catalog.
         "model.skills.write",
+        # Coordinator out-of-band send capability — granted to
+        # ``builtin-admin`` by migration 042 but previously absent
+        # from this validator, which made it impossible to add to a
+        # custom role or restore via the overrides editor.
+        "coordinator.trust.send",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -5912,8 +5958,28 @@ _VALID_PERMISSIONS = frozenset(
 )
 
 
+def _enrich_role(row: dict[str, Any], eff: dict[str, list[str]]) -> dict[str, Any]:
+    """Add overlay fields (effective / grants / revokes) to a role dict.
+
+    For builtin rows, ``effective`` is the post-overlay set; for custom
+    rows it's just the parsed ``permissions`` column with empty deltas.
+    Keeps a single round-trip shape so the admin UI can render chips +
+    "modified" indicators without per-row fetches.
+
+    Caller supplies the prefetched ``eff`` dict from
+    :meth:`effective_role_permissions_bulk` so admin_list_roles needs
+    one storage round-trip total instead of 1 + 2*builtin_count.
+    """
+    return {
+        **row,
+        "effective": eff["effective"],
+        "grants": eff["grants"] if row.get("builtin") else [],
+        "revokes": eff["revokes"] if row.get("builtin") else [],
+    }
+
+
 async def admin_list_roles(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/roles — list all roles."""
+    """GET /v1/api/admin/roles — list all roles with overlay info."""
     from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -5923,7 +5989,18 @@ async def admin_list_roles(request: Request) -> JSONResponse:
     err = require_permission(request, "admin.roles")
     if err:
         return err
-    return JSONResponse({"roles": storage.list_roles()})
+    rows = storage.list_roles()
+    eff_map = storage.effective_role_permissions_bulk([r["role_id"] for r in rows])
+    return JSONResponse(
+        {
+            "roles": [
+                _enrich_role(
+                    r, eff_map.get(r["role_id"], {"effective": [], "grants": [], "revokes": []})
+                )
+                for r in rows
+            ]
+        }
+    )
 
 
 async def admin_create_role(request: Request) -> JSONResponse:
@@ -6074,6 +6151,148 @@ async def admin_delete_role(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+async def admin_role_effective(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/roles/{role_id}/effective — baseline + overrides."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+
+    role_id = request.path_params["role_id"]
+    if storage.get_role(role_id) is None:
+        return JSONResponse({"error": "Role not found"}, status_code=404)
+    return JSONResponse(storage.effective_role_permissions(role_id))
+
+
+def _check_admin_lockout(
+    storage: Any,
+    role_id: str,
+    grants: set[str],
+    revokes: set[str],
+) -> JSONResponse | None:
+    """Refuse override changes that would leave nobody with admin.roles.
+
+    ``admin.roles`` is the only permission whose loss is self-locking —
+    without it, no user can reach the Roles tab to undo the change.  Other
+    revoked permissions (``model.skills.write``, ``admin.skills``, etc.)
+    can always be restored by an admin, so they don't get this guard.
+
+    PUT-replace semantics on ``set_role_overrides`` mean the lockout
+    surface isn't just "did the new payload revoke admin.roles" — it's
+    also "did the new payload omit a previously-granted admin.roles
+    override."  Either path lands at the same effective state, so the
+    check computes the post-PUT effective set on the target role and
+    falls through to a bulk users_with_permission query for any user
+    who retains the perm via another role.
+
+    Two queries total (one ``get_role`` for the target's baseline, one
+    join over ``user_roles ⋈ roles`` plus IN-fetch on overrides for the
+    builtin role ids), regardless of cluster user/role count.  Caller
+    is expected to wrap this in ``asyncio.to_thread`` since both
+    SQLite and asyncpg-via-sync-wrapper open new connections.
+    """
+    role = storage.get_role(role_id)
+    if role is None:
+        return None  # caller already validated existence; defensive no-op
+    baseline = {p.strip() for p in (role.get("permissions") or "").split(",") if p.strip()}
+    # Simulate the proposed PUT on the target role.  If admin.roles
+    # survives there, every user assigned to the target keeps it; we're
+    # done.
+    target_effective = (baseline | grants) - revokes
+    if "admin.roles" in target_effective:
+        return None
+    # admin.roles is leaving the target role.  Only need a single user
+    # who still holds it through some OTHER role to keep the cluster
+    # recoverable.  ``exclude_role_id`` makes that one SQL question
+    # instead of N+M round-trips.
+    if storage.users_with_permission("admin.roles", exclude_role_id=role_id):
+        return None
+    return JSONResponse(
+        {"error": "Refusing change: would leave no user with admin.roles"},
+        status_code=409,
+    )
+
+
+async def admin_role_overrides(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/roles/{role_id}/overrides — replace grant/revoke set."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+
+    role_id = request.path_params["role_id"]
+    existing = storage.get_role(role_id)
+    if existing is None:
+        return JSONResponse({"error": "Role not found"}, status_code=404)
+    if not existing.get("builtin"):
+        return JSONResponse(
+            {"error": "Overrides apply only to builtin roles; edit custom roles directly"},
+            status_code=400,
+        )
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    grant_list = body.get("grant", []) or []
+    revoke_list = body.get("revoke", []) or []
+    if not isinstance(grant_list, list) or not isinstance(revoke_list, list):
+        return JSONResponse({"error": "grant and revoke must be arrays"}, status_code=400)
+    grants = {str(p) for p in grant_list}
+    revokes = {str(p) for p in revoke_list}
+
+    invalid = sorted((grants | revokes) - _VALID_PERMISSIONS)
+    if invalid:
+        return JSONResponse(
+            {"error": f"Invalid permissions: {', '.join(invalid)}"},
+            status_code=400,
+        )
+    if grants & revokes:
+        return JSONResponse(
+            {"error": "A permission cannot appear in both grant and revoke"},
+            status_code=400,
+        )
+
+    # Strip no-ops: grants already in baseline and revokes not in baseline both
+    # have zero effect on the merged set. Storing them wastes rows and clutters
+    # the audit detail without changing behavior.
+    baseline = {p.strip() for p in (existing.get("permissions") or "").split(",") if p.strip()}
+    grants = grants - baseline
+    revokes = revokes & baseline
+
+    # Block in a worker thread — even bulk-querying the lockout state
+    # touches sync DB connections (SQLite open, asyncpg sync wrapper)
+    # and should never run inline on the asyncio event loop.
+    lockout = await asyncio.to_thread(_check_admin_lockout, storage, role_id, grants, revokes)
+    if lockout is not None:
+        return lockout
+
+    audit_uid, ip = _audit_context(request)
+    storage.set_role_overrides(role_id, grants, revokes, created_by=audit_uid)
+    record_audit(
+        storage,
+        audit_uid,
+        "role.overrides.set",
+        "role",
+        role_id,
+        {"grants": sorted(grants), "revokes": sorted(revokes)},
+        ip,
+    )
+
+    return JSONResponse(storage.effective_role_permissions(role_id))
+
+
 async def admin_list_user_roles(request: Request) -> JSONResponse:
     """GET /v1/api/admin/users/{user_id}/roles — list roles assigned to a user."""
     from turnstone.core.auth import require_permission
@@ -6129,10 +6348,14 @@ async def admin_assign_role(request: Request) -> JSONResponse:
     if auth_result and auth_result.user_id == user_id:
         return JSONResponse({"error": "Cannot modify own role assignments"}, status_code=403)
 
-    # Ensure caller holds all permissions present in the target role
-    target_perms = set(
-        p.strip() for p in target_role.get("permissions", "").split(",") if p.strip()
-    )
+    # Ensure caller holds all permissions present in the target role.
+    # Read the EFFECTIVE perm set (post-overlay) rather than the raw
+    # ``permissions`` baseline column — builtin roles can carry an
+    # override layer added via PUT ``/v1/api/admin/roles/{id}/overrides``,
+    # and skipping the overlay here would let an admin.roles holder
+    # silently bypass the subset gate by granting a perm to e.g.
+    # builtin-operator before assigning that role to a new user.
+    target_perms = set(storage.effective_role_permissions(role_id)["effective"])
     if (
         auth_result
         and auth_result.permissions
@@ -12507,6 +12730,12 @@ def create_app(
                     Route("/api/admin/roles", admin_create_role, methods=["POST"]),
                     Route("/api/admin/roles/{role_id}", admin_update_role, methods=["PUT"]),
                     Route("/api/admin/roles/{role_id}", admin_delete_role, methods=["DELETE"]),
+                    Route("/api/admin/roles/{role_id}/effective", admin_role_effective),
+                    Route(
+                        "/api/admin/roles/{role_id}/overrides",
+                        admin_role_overrides,
+                        methods=["PUT"],
+                    ),
                     Route("/api/admin/users/{user_id}/roles", admin_list_user_roles),
                     Route(
                         "/api/admin/users/{user_id}/roles",

@@ -28,6 +28,8 @@ from turnstone.console.server import (
     admin_list_policies,
     admin_list_roles,
     admin_list_user_roles,
+    admin_role_effective,
+    admin_role_overrides,
     admin_unassign_role,
     admin_update_org,
     admin_update_policy,
@@ -100,6 +102,12 @@ def client(storage):
                     Route("/api/admin/roles", admin_create_role, methods=["POST"]),
                     Route("/api/admin/roles/{role_id}", admin_update_role, methods=["PUT"]),
                     Route("/api/admin/roles/{role_id}", admin_delete_role, methods=["DELETE"]),
+                    Route("/api/admin/roles/{role_id}/effective", admin_role_effective),
+                    Route(
+                        "/api/admin/roles/{role_id}/overrides",
+                        admin_role_overrides,
+                        methods=["PUT"],
+                    ),
                     # Users
                     Route(
                         "/api/admin/users/{user_id}",
@@ -217,6 +225,94 @@ class TestRoles:
         assert resp.status_code == 200, resp.json()
         assert "model.skills.write" in resp.json()["permissions"]
 
+    def test_permission_sections_js_covers_valid_permissions(self):
+        """F-5: ``_PERMISSION_SECTIONS`` in governance.js mirrors
+        ``_VALID_PERMISSIONS`` in console/server.py.  A new perm added
+        to the Python validator without a matching JS toggle becomes
+        silently un-customizable through the admin Roles UI — the only
+        documented path for granting/revoking perms on a builtin.
+        Catches the same shape that surfaced ``coordinator.trust.send``
+        missing from the validator during manual verification of the
+        overlay editor (a similar drift, in the opposite direction)."""
+        import re
+        from pathlib import Path
+
+        from turnstone.console.server import _VALID_PERMISSIONS
+
+        src = Path("turnstone/console/static/governance.js").read_text()
+        # _PERMISSION_SECTIONS is a `const X = [...]` containing nested
+        # `permissions: ["a", "b", ...]` arrays.  Pull every quoted
+        # string out of every permissions: [...] block; we don't need
+        # a full JS parser to enumerate the perm names.
+        m = re.search(
+            r"const _PERMISSION_SECTIONS\s*=\s*\[(.*?)\];",
+            src,
+            re.DOTALL,
+        )
+        assert m, "could not locate _PERMISSION_SECTIONS in governance.js"
+        body = m.group(1)
+        in_ui = set(re.findall(r'"([a-z][a-z._]*)"', body))
+        # Exclude the section labels themselves (they're sentence-case
+        # like "Scopes", "Admin"; the regex above already excludes them
+        # by anchoring on lowercase, but be explicit about intent).
+        missing_in_ui = sorted(_VALID_PERMISSIONS - in_ui)
+        extra_in_ui = sorted(in_ui - _VALID_PERMISSIONS)
+        assert not missing_in_ui, (
+            f"perms in _VALID_PERMISSIONS but not _PERMISSION_SECTIONS "
+            f"(silently un-customizable in admin UI): {missing_in_ui}"
+        )
+        assert not extra_in_ui, (
+            f"perms in _PERMISSION_SECTIONS but not _VALID_PERMISSIONS "
+            f"(toggle would 400 on save): {extra_in_ui}"
+        )
+
+    def test_valid_permissions_covers_all_seeded_builtin_perms(self):
+        """Every permission migration 008/011/014/015/029/032/033/035/040/042
+        adds to a builtin role must be in ``_VALID_PERMISSIONS`` — otherwise
+        the overrides editor cannot round-trip the baseline (a perm dropped
+        from the toggle universe gets stripped to satisfy the validator,
+        producing a silent capability loss).  Caught by the manual
+        verification run of feat/builtin-role-overrides:
+        ``coordinator.trust.send`` was in the baseline but not the
+        validator, so the very first Save through the overrides editor
+        400'd."""
+        from turnstone.console.server import _VALID_PERMISSIONS
+
+        # Mirror the union the bootstrap migrations write into the baseline
+        # ``permissions`` column for builtin-admin.  Keep this in sync with
+        # 017_catchup_admin_permissions.py and every subsequent migration
+        # that touches builtin-admin.
+        seeded = {
+            "read",
+            "write",
+            "approve",
+            "admin.users",
+            "admin.roles",
+            "admin.orgs",
+            "admin.policies",
+            "admin.prompt_policies",
+            "admin.skills",
+            "admin.audit",
+            "admin.usage",
+            "admin.schedules",
+            "admin.watches",
+            "admin.judge",
+            "admin.memories",
+            "admin.settings",
+            "admin.mcp",
+            "admin.models",
+            "admin.nodes",
+            "admin.coordinator",
+            "admin.cluster.inspect",
+            "tools.approve",
+            "workstreams.create",
+            "workstreams.close",
+            "conversation.modify",
+            "coordinator.trust.send",
+        }
+        missing = sorted(seeded - _VALID_PERMISSIONS)
+        assert not missing, f"perms in baseline but not _VALID_PERMISSIONS: {missing}"
+
     def test_create_role_rejects_unknown_permission(self, client):
         """Unknown permission strings are rejected — guards the validator
         against typos in the constant list and would-be capability inflation
@@ -309,6 +405,242 @@ class TestRoles:
         resp = client.delete("/v1/api/admin/roles/builtin-viewer")
         assert resp.status_code == 400
         assert "builtin" in resp.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests — Role permission overrides (builtin customization)
+# ---------------------------------------------------------------------------
+
+
+def _seed_builtin_admin(storage: Any, perms: str = "read,write,admin.roles") -> None:
+    storage.create_role(
+        role_id="builtin-admin",
+        name="admin",
+        display_name="Admin",
+        permissions=perms,
+        builtin=True,
+    )
+    storage.assign_role("test-admin", "builtin-admin")
+
+
+class TestRoleOverrides:
+    def test_effective_returns_baseline_when_no_overrides(self, client, storage):
+        _seed_builtin_admin(storage, "read,admin.roles")
+        resp = client.get("/v1/api/admin/roles/builtin-admin/effective")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["baseline"] == ["admin.roles", "read"]
+        assert body["grants"] == []
+        assert body["revokes"] == []
+        assert body["effective"] == ["admin.roles", "read"]
+
+    def test_effective_404_unknown_role(self, client):
+        resp = client.get("/v1/api/admin/roles/nope/effective")
+        assert resp.status_code == 404
+
+    def test_overrides_grant_skills_write(self, client, storage):
+        # The motivating case: model.skills.write is default-ungranted,
+        # operator opts in via the overrides endpoint.
+        _seed_builtin_admin(storage, "read,write,admin.roles")
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": ["model.skills.write"], "revoke": []},
+        )
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert "model.skills.write" in body["effective"]
+        assert body["grants"] == ["model.skills.write"]
+
+    def test_overrides_replace_semantics(self, client, storage):
+        _seed_builtin_admin(storage, "read,write,admin.roles")
+        client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": ["model.skills.write"], "revoke": []},
+        )
+        # PUT replaces — the prior grant should be gone after sending an
+        # empty body, leaving only the new revoke (which IS in baseline).
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": [], "revoke": ["write"]},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["grants"] == []
+        assert body["revokes"] == ["write"]
+        assert "model.skills.write" not in body["effective"]
+
+    def test_overrides_invalid_permission_rejected(self, client, storage):
+        _seed_builtin_admin(storage)
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": ["totally.fake.perm"], "revoke": []},
+        )
+        assert resp.status_code == 400
+        assert "invalid" in resp.json()["error"].lower()
+
+    def test_overrides_disjoint_grant_revoke_rejected(self, client, storage):
+        _seed_builtin_admin(storage)
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": ["approve"], "revoke": ["approve"]},
+        )
+        assert resp.status_code == 400
+
+    def test_overrides_non_builtin_rejected(self, client, storage):
+        storage.create_role(
+            role_id="custom-1",
+            name="custom",
+            display_name="Custom",
+            permissions="read",
+            builtin=False,
+        )
+        resp = client.put(
+            "/v1/api/admin/roles/custom-1/overrides",
+            json={"grant": ["write"], "revoke": []},
+        )
+        assert resp.status_code == 400
+        assert "builtin" in resp.json()["error"].lower()
+
+    def test_overrides_no_op_grant_and_revoke_normalize(self, client, storage):
+        # A grant of a perm already in baseline AND a revoke of a perm not
+        # in baseline both have zero behavioural effect; the endpoint
+        # strips them rather than persisting redundant rows.
+        _seed_builtin_admin(storage, "read,write,admin.roles")
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={
+                "grant": ["read", "model.skills.write"],
+                "revoke": ["tools.approve"],
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # Only the meaningful delta survived.
+        assert body["grants"] == ["model.skills.write"]
+        assert body["revokes"] == []
+
+    def test_overrides_lockout_guard_blocks_last_admin_revoke(self, client, storage):
+        _seed_builtin_admin(storage, "read,admin.roles")
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": [], "revoke": ["admin.roles"]},
+        )
+        assert resp.status_code == 409
+        assert "admin.roles" in resp.json()["error"]
+        # Verify the override was NOT applied — the user must still be admin.
+        assert "admin.roles" in storage.get_user_permissions("test-admin")
+
+    def test_overrides_lockout_guard_permits_revoke_when_other_admin_exists(self, client, storage):
+        _seed_builtin_admin(storage, "read,admin.roles")
+        # Second role on a different user that also carries admin.roles —
+        # revoking from builtin-admin no longer locks the deployment out.
+        storage.create_role(
+            role_id="custom-admin",
+            name="custom-admin",
+            display_name="Custom Admin",
+            permissions="read,admin.roles",
+            builtin=False,
+        )
+        storage.assign_role("user-1", "custom-admin")
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": [], "revoke": ["admin.roles"]},
+        )
+        assert resp.status_code == 200
+
+    def test_list_roles_includes_overlay_fields(self, client, storage):
+        _seed_builtin_admin(storage, "read,admin.roles")
+        client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": ["model.skills.write"], "revoke": []},
+        )
+        resp = client.get("/v1/api/admin/roles")
+        roles = resp.json()["roles"]
+        # Find builtin-admin in the listing
+        row = next(r for r in roles if r["role_id"] == "builtin-admin")
+        assert row["grants"] == ["model.skills.write"]
+        assert row["revokes"] == []
+        assert "model.skills.write" in row["effective"]
+
+    def test_overrides_lockout_guard_blocks_grant_removal(self, client, storage):
+        # F-1: PUT-replace semantics mean an existing grant of admin.roles
+        # on a role whose baseline lacks it is silently dropped when the
+        # new payload omits it.  Old guard only fired on explicit revokes
+        # and missed this path entirely — concrete cluster-bricking scenario.
+        # Setup: only builtin-operator users hold admin.roles, via overlay grant.
+        storage.create_role(
+            role_id="builtin-operator",
+            name="operator",
+            display_name="Operator",
+            permissions="read,write",  # baseline lacks admin.roles
+            builtin=True,
+        )
+        # Grant admin.roles to operator via overlay, then unassign builtin-admin
+        # from the test user so operator is the only path to admin.roles.
+        storage.set_role_overrides("builtin-operator", {"admin.roles"}, set())
+        storage.assign_role("test-admin", "builtin-operator")
+        # The test-admin user keeps builtin-admin assigned by _seed_builtin_admin
+        # which would normally hold admin.roles — but we seed without it so the
+        # only source is the overlay on builtin-operator.
+        if storage.get_role("builtin-admin") is None:
+            storage.create_role(
+                role_id="builtin-admin",
+                name="admin",
+                display_name="Admin",
+                permissions="read,write",  # baseline lacks admin.roles
+                builtin=True,
+            )
+            storage.assign_role("test-admin", "builtin-admin")
+        # Sanity: admin.roles only reachable via operator's overlay
+        assert "admin.roles" in storage.get_user_permissions("test-admin")
+        # The lockout-triggering call: Reset operator's overrides (drops
+        # the admin.roles grant).  Old guard short-circuited because
+        # revoke=[] doesn't contain "admin.roles"; new guard simulates
+        # the post-PUT effective set on the target role.
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-operator/overrides",
+            json={"grant": [], "revoke": []},
+        )
+        assert resp.status_code == 409, resp.json()
+        assert "admin.roles" in resp.json()["error"]
+        # Override was NOT applied — admin.roles still reachable.
+        assert "admin.roles" in storage.get_user_permissions("test-admin")
+
+    def test_assign_role_blocks_escalation_via_overlay_grant(self, storage, client):
+        # F-2 reframed.  Simulates the attack path where a previous
+        # admin.roles holder injected an overlay grant on a builtin
+        # role, then a separate admin.users holder (who does NOT hold
+        # the granted perm) tries to assign that role to a new user.
+        # Without this fix the assign-time subset check would read the
+        # baseline column and miss the overlay, silently escalating
+        # the assignee.
+        #
+        # Operator's baseline is unchanged production default
+        # ("read,write" — no model.skills.write).  The overlay grant
+        # below is the simulated attack step, not the system default.
+        _seed_builtin_admin(storage, "read,write,admin.roles,admin.users")
+        storage.create_role(
+            role_id="builtin-operator",
+            name="operator",
+            display_name="Operator",
+            permissions="read,write",  # production default
+            builtin=True,
+        )
+        storage.set_role_overrides(
+            "builtin-operator", {"model.skills.write"}, set()
+        )  # simulated prior poisoning by an admin.roles holder
+
+        # The harness AuthResult holds admin.roles + admin.users + many
+        # admin.* perms but NOT model.skills.write.  Assigning operator
+        # — whose POST-OVERLAY effective set in this test scenario
+        # contains model.skills.write — must 403, because the assignee
+        # would otherwise gain a perm the assigner doesn't hold.
+        resp = client.post(
+            "/v1/api/admin/users/user-1/roles",
+            json={"role_id": "builtin-operator"},
+        )
+        assert resp.status_code == 403
+        assert "permissions you do not hold" in resp.json()["error"]
 
 
 # ---------------------------------------------------------------------------

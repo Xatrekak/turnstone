@@ -695,7 +695,11 @@ def register_coord_verbs(
 # ---------------------------------------------------------------------------
 
 
-def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
+def make_approve_handler(
+    cfg: SessionEndpointConfig,
+    *,
+    accepted_permissions: tuple[str, ...] = (),
+) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/approve``.
 
     Resolves a pending tool approval on the workstream's UI. Both
@@ -704,7 +708,17 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
     differences are auth scope, manager lookup, and the
     ``__budget_override__`` filter (interactive-only — coord workstreams
     don't have the budget-override pseudo-tool).
+
+    ``accepted_permissions`` is OR-checked via :func:`require_any_permission`
+    only when ``cfg.permission_gate`` is ``None`` — i.e. for the
+    interactive kind, where it IS the primary gate (not a fallback to
+    something else). Coord's ``permission_gate`` already takes
+    precedence so admin-coordinator users don't also need
+    ``tools.approve`` to act on their own coord workstreams. Pass
+    ``admin.coordinator`` alongside ``tools.approve`` for endpoints
+    reachable by coord sessions spawning interactive children.
     """
+    from turnstone.core.auth import require_any_permission
     from turnstone.core.web_helpers import read_json_or_400
 
     async def approve(request: Request) -> Response:
@@ -712,6 +726,10 @@ def make_approve_handler(cfg: SessionEndpointConfig) -> Handler:
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
             if err is not None:
                 return err
         mgr_opt, err503 = cfg.manager_lookup(request)
@@ -826,6 +844,7 @@ def make_close_handler(
     *,
     audit_emit: CloseAuditEmitter | None = None,
     supports_close_reason: bool = False,
+    accepted_permissions: tuple[str, ...] = (),
 ) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/close``.
 
@@ -870,8 +889,14 @@ def make_close_handler(
     async def close(request: Request) -> Response:
         import asyncio
 
+        from turnstone.core.auth import require_any_permission
+
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
             if err is not None:
                 return err
         mgr_opt, err503 = cfg.manager_lookup(request)
@@ -1726,6 +1751,7 @@ def make_create_handler(
     cfg: SessionEndpointConfig,
     *,
     audit_emit: CreateAuditEmitter | None = None,
+    accepted_permissions: tuple[str, ...] = (),
 ) -> Handler:
     """Lifted body for ``POST {prefix}/new`` — workstream creation.
 
@@ -1861,6 +1887,7 @@ def make_create_handler(
             IMAGE_SIZE_CAP,
             validate_and_save_uploaded_files,
         )
+        from turnstone.core.auth import require_any_permission
         from turnstone.core.web_helpers import (
             read_json_or_400,
             read_multipart_create_or_400,
@@ -1868,6 +1895,10 @@ def make_create_handler(
 
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        elif accepted_permissions:
+            err = require_any_permission(request, accepted_permissions)
             if err is not None:
                 return err
         mgr_opt, err503 = cfg.manager_lookup(request)

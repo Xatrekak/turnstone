@@ -4078,11 +4078,28 @@ def create_app(
         # both saved AND loaded is a normal display state.
         saved_loaded_lookup=None,
     )
-    approve_handler = make_approve_handler(interactive_endpoint_config)
+    # ``accepted_permissions`` gates the lifted body on any one of the
+    # named perms when ``cfg.permission_gate`` is ``None`` (interactive
+    # case) — for the interactive kind it IS the primary gate, not a
+    # fallback.  Coord's ``permission_gate`` (admin.coordinator) takes
+    # precedence on the coord-config side; here we accept ``admin.
+    # coordinator`` as a parallel allow so a coord session spawning an
+    # interactive child workstream isn't blocked by the operator-style
+    # perm requirement.  Was a pre-existing security smell: the
+    # ``workstreams.create`` / ``workstreams.close`` / ``tools.approve``
+    # perms were declared and seeded into builtin-operator's baseline
+    # but never wired to a gate — any authenticated user could hit
+    # these endpoints regardless of role.  See PR adding 057_role_
+    # permission_overrides for the audit that surfaced this.
+    approve_handler = make_approve_handler(
+        interactive_endpoint_config,
+        accepted_permissions=("tools.approve", "admin.coordinator"),
+    )
     close_handler = make_close_handler(
         interactive_endpoint_config,
         audit_emit=_audit_close_workstream,
         supports_close_reason=True,
+        accepted_permissions=("workstreams.close", "admin.coordinator"),
     )
     cancel_handler = make_cancel_handler(interactive_endpoint_config)
     open_handler = make_open_handler(
@@ -4096,6 +4113,7 @@ def create_app(
     create_handler = make_create_handler(
         interactive_endpoint_config,
         audit_emit=_audit_workstream_created,
+        accepted_permissions=("workstreams.create", "admin.coordinator"),
     )
     list_handler = make_list_handler(interactive_endpoint_config)
     saved_handler = make_saved_handler(interactive_endpoint_config)
