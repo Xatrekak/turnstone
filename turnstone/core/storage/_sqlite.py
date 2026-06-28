@@ -75,6 +75,9 @@ from turnstone.core.storage._schema import (
     prompt_policies as prompt_policies_t,
 )
 from turnstone.core.storage._utils import (
+    COMPACTION_SOURCE as _COMPACTION_SOURCE,
+)
+from turnstone.core.storage._utils import (
     HEURISTIC_RULE_MUTABLE as _HEURISTIC_RULE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -136,7 +139,7 @@ from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
 from turnstone.core.storage._utils import (
-    reconstruct_turns as _reconstruct_turns,
+    reconstruct_turns_checkpointed as _reconstruct_turns_checkpointed,
 )
 from turnstone.core.storage._utils import (
     recover_trajectory as _recover_trajectory,
@@ -500,14 +503,24 @@ class SQLiteBackend:
         msg_rows, attachments = self._conversation_rows(ws_id, limit)
         return _reconstruct_messages(msg_rows, ws_id, attachments, repair=repair)
 
-    def load_message_turns(self, ws_id: str) -> list[Turn]:
+    def load_message_turns(self, ws_id: str, *, checkpointed: bool = True) -> list[Turn]:
         """Load the conversation as canonical ``Turn``s (unresolved AttachmentRef).
 
         The resume path: ``session.messages`` holds the by-reference content;
         bytes are materialized at each output (wire / display), never here.
+
+        Checkpoint-aware (``checkpointed=True``, the resume default): if the
+        conversation carries a persisted compaction marker, only ``[summary] +
+        [rows after its watermark]`` rehydrate (the bounded view the live session
+        held when it compacted) — not the full pre-compaction transcript, which
+        can overflow the model window on reopen.  ``checkpointed=False`` returns
+        the full transcript (markers dropped) for export/audit consumers that
+        must not lose pre-compaction history.
         """
         msg_rows, attachments = self._conversation_rows(ws_id, None)
-        return _recover_trajectory(_reconstruct_turns(msg_rows, ws_id, attachments))
+        return _recover_trajectory(
+            _reconstruct_turns_checkpointed(msg_rows, ws_id, attachments, checkpoint=checkpointed)
+        )
 
     def _resolve_row_attachments(self, rows: Sequence[Any]) -> dict[int, list[dict[str, Any]]]:
         """Build the ``reconstruct_messages`` attachment map from row ref-lists.
@@ -538,6 +551,80 @@ class SQLiteBackend:
                 )
             ).fetchone()
         return int(row[0]) if row is not None and row[0] is not None else None
+
+    def get_compaction_watermark(self, ws_id: str, preserve_tail: int = 0) -> int | None:
+        """Boundary id for a compaction checkpoint: the max conversation ``id``
+        among the rows a compaction would summarize.
+
+        With ``preserve_tail=0`` (the auto/overflow path) every current row is
+        summarized, so this is the newest real id.  With ``preserve_tail=N`` the
+        newest ``N`` rows are kept verbatim, so the boundary is the ``(N+1)``-th
+        newest id — counting REAL rows from the newest.  Compaction markers are
+        excluded: they are summary artifacts written as new rows but never part
+        of the preserved in-memory tail, so counting them would skew the boundary
+        and drop real tail rows on resume.  ``None`` when there are no rows.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(conversations.c.id)
+                .where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        sa.or_(
+                            conversations.c._source.is_(None),
+                            conversations.c._source != _COMPACTION_SOURCE,
+                        ),
+                    )
+                )
+                .order_by(conversations.c.id.desc())
+                .limit(1)
+                .offset(max(0, preserve_tail))
+            ).fetchone()
+        return int(row[0]) if row is not None else None
+
+    def count_messages(self, ws_id: str) -> int:
+        """Total conversation rows for ``ws_id`` (compaction markers included)."""
+        with self._conn() as conn:
+            n = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(conversations)
+                .where(conversations.c.ws_id == ws_id)
+            ).scalar()
+        return int(n or 0)
+
+    def get_compaction_floor(self, ws_id: str) -> int:
+        """Rows that back the latest compaction summary and must survive a
+        rewind/retry: every row with ``id <= the latest marker's id`` (the
+        summarized prefix plus the marker).  ``0`` when the ws never compacted.
+
+        rewind/retry trim the conversation TAIL, but after a compaction the
+        in-memory summary turns no longer map 1:1 to storage rows, so a delete
+        keyed on ``len(self.messages)`` would keep the oldest summarized rows and
+        drop the marker.  Flooring the delete at this count keeps the summary's
+        backing intact.
+        """
+        with self._conn() as conn:
+            marker_id = conn.execute(
+                sa.select(sa.func.max(conversations.c.id)).where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c._source == _COMPACTION_SOURCE,
+                    )
+                )
+            ).scalar()
+            if marker_id is None:
+                return 0
+            n = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(conversations)
+                .where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c.id <= marker_id,
+                    )
+                )
+            ).scalar()
+        return int(n or 0)
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
@@ -1303,9 +1390,18 @@ class SQLiteBackend:
                             "FROM conversations_fts f "
                             "JOIN conversations c ON c.id = f.rowid "
                             "WHERE conversations_fts MATCH :query "
+                            # Exclude compaction-checkpoint markers (resume-only
+                            # summary artifacts); normal rows store _source NULL,
+                            # so the filter must be NULL-safe or it drops everything.
+                            "AND (c._source IS NULL OR c._source <> :compaction_source) "
                             "ORDER BY f.rank ASC LIMIT :limit OFFSET :offset"
                         ),
-                        {"query": _fts5_query(query), "limit": capped, "offset": capped_offset},
+                        {
+                            "query": _fts5_query(query),
+                            "compaction_source": _COMPACTION_SOURCE,
+                            "limit": capped,
+                            "offset": capped_offset,
+                        },
                     ).fetchall()
                 )
             return list(
@@ -1313,10 +1409,12 @@ class SQLiteBackend:
                     sa.text(
                         "SELECT timestamp, ws_id, role, content, tool_name "
                         "FROM conversations WHERE content LIKE :pattern ESCAPE '\\' "
+                        "AND (_source IS NULL OR _source <> :compaction_source) "
                         "ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
                     ),
                     {
                         "pattern": f"%{_escape_like(query)}%",
+                        "compaction_source": _COMPACTION_SOURCE,
                         "limit": capped,
                         "offset": capped_offset,
                     },
@@ -1330,9 +1428,11 @@ class SQLiteBackend:
                 conn.execute(
                     sa.text(
                         "SELECT timestamp, ws_id, role, content, tool_name "
-                        "FROM conversations ORDER BY timestamp DESC LIMIT :limit"
+                        "FROM conversations "
+                        "WHERE (_source IS NULL OR _source <> :compaction_source) "
+                        "ORDER BY timestamp DESC LIMIT :limit"
                     ),
-                    {"limit": capped},
+                    {"limit": capped, "compaction_source": _COMPACTION_SOURCE},
                 ).fetchall()
             )
 
