@@ -193,7 +193,7 @@ services:
       # SearxNG web UI — localhost-only (it has no auth). Browse https://localhost:8444.
       - "127.0.0.1:${SEARXNG_HTTPS_PORT:-8444}:8444"
     volumes:
-      - ./turnstone/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./turnstone/deploy/Caddyfile:/etc/caddy/Caddyfile
       - caddy-data:/data # persist Caddy's local CA across restarts
       - caddy-config:/config
     networks:
@@ -248,7 +248,7 @@ services:
     ports:
       - "${TURNSTONE_HOST_IP:-127.0.0.1}:${SEARXNG_API_PORT:-8081}:8080"
     volumes:
-      - ./turnstone/deploy/searxng:/etc/searxng:ro
+      - ./turnstone/deploy/searxng:/etc/searxng
       - searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)
     networks:
       - turnstone-net
